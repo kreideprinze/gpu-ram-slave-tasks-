@@ -2,18 +2,21 @@ import cv2
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
+from tqdm import tqdm
+import os
+from collections import defaultdict
 
 # --- USER INPUT ---
-VIDEO_PATH = '2025-12-20_04:24:44PM_flight5.avi'  # Replace with your video file path
+VIDEO_PATH = '2025-12-20_04:24:44PM_flight5.avi'
 CSV_PATH = 'second wind.csv'
+PIXELS_PER_METER = 5  # Adjusted automatically from altitude (~6m)
+TILE_SIZE_PX = 512
 
 # Replace with actual camera intrinsics
-K = np.array([[973.36879615, 0, 642.90295147],  # fx, 0, cx
-              [0, 972.01937, 327.62201959],  # 0, fy, cy
-              [0,   0,   1]])
+K = np.array([[700, 0, 640], [0, 700, 360], [0, 0, 1]])
 
-# Replace with actual extrinsics (rotation and translation from Pixhawk to camera)
-R_cam_body = np.eye(3)  # Identity for now
+# 90-degree rotation around Z-axis from Pixhawk heading
+R_cam_body = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
 t_cam_body = np.zeros((3, 1))
 
 # --- Load CSV ---
@@ -31,7 +34,7 @@ transformer = Transformer.from_pipeline(proj_pipeline)
 
 E, N, U = transformer.transform(df['Lat'].values, df['Lon'].values, df['Altitude_m'].values)
 
-# --- Euler Angles to Rotation Matrix ---
+# --- Euler to Rotation ---
 def euler_to_rotmat(roll, pitch, yaw):
     roll, pitch, yaw = np.deg2rad([roll, pitch, yaw])
     Rx = np.array([[1, 0, 0], [0, np.cos(roll), -np.sin(roll)], [0, np.sin(roll), np.cos(roll)]])
@@ -43,15 +46,17 @@ def euler_to_rotmat(roll, pitch, yaw):
 video = cv2.VideoCapture(VIDEO_PATH)
 if not video.isOpened():
     raise IOError("Cannot open video file")
-
 frame_w = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_h = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
 corners = np.array([[0, 0, 1], [frame_w-1, 0, 1], [frame_w-1, frame_h-1, 1], [0, frame_h-1, 1]]).T
 
-# --- Compute Homographies ---
-homographies = []
-frames = []
-for i, row in df.iterrows():
+# --- TILE STITCHING ---
+tiles = defaultdict(lambda: np.zeros((TILE_SIZE_PX, TILE_SIZE_PX, 3), dtype=np.uint8))
+counts = defaultdict(int)
+
+print("Stitching into tiles...")
+for i in tqdm(range(len(df))):
+    row = df.loc[i]
     frame_idx = int(row['Frame'])
     video.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ret, frame = video.read()
@@ -62,33 +67,46 @@ for i, row in df.iterrows():
     R_cam = R_body @ R_cam_body
     t_cam = R_body @ t_cam_body + np.array([[x], [y], [z]])
     H = K @ np.hstack((R_cam[:, :2], t_cam))
-    H = np.linalg.inv(H)
-    homographies.append(H)
-    frames.append(frame)
+    try:
+        H = np.linalg.inv(H)
+    except:
+        continue
+    if not np.isfinite(H).all():
+        continue
+    # Warp image to flat ground
+    scale = PIXELS_PER_METER
+    tile_x = int(x * scale) // TILE_SIZE_PX
+    tile_y = int(y * scale) // TILE_SIZE_PX
+    offset_x = tile_x * TILE_SIZE_PX
+    offset_y = tile_y * TILE_SIZE_PX
 
-# --- Determine Map Bounds ---
-min_x = min_y = np.inf
-max_x = max_y = -np.inf
-for H in homographies:
-    pts = H @ corners
-    pts /= pts[2]
-    xs, ys = pts[0], pts[1]
-    min_x = min(min_x, xs.min())
-    max_x = max(max_x, xs.max())
-    min_y = min(min_y, ys.min())
-    max_y = max(max_y, ys.max())
-
-canvas_width = int(np.ceil(max_x - min_x))
-canvas_height = int(np.ceil(max_y - min_y))
-offset = np.array([[1, 0, -min_x], [0, 1, -min_y], [0, 0, 1]])
-stitched = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-
-# --- Warp Frames to Canvas ---
-for frame, H in zip(frames, homographies):
+    canvas = np.zeros((TILE_SIZE_PX, TILE_SIZE_PX, 3), dtype=np.uint8)
+    offset = np.array([[1, 0, -offset_x / scale], [0, 1, -offset_y / scale], [0, 0, 1]])
     H_canvas = offset @ H
-    warped = cv2.warpPerspective(frame, H_canvas, (canvas_width, canvas_height))
+    try:
+        warped = cv2.warpPerspective(frame, H_canvas * scale, (TILE_SIZE_PX, TILE_SIZE_PX))
+    except:
+        continue
     mask = (warped > 0).any(axis=2)
-    stitched[mask] = warped[mask]
+    tiles[(tile_x, tile_y)][mask] = warped[mask]
+    counts[(tile_x, tile_y)] += 1
 
-cv2.imwrite('stitched_map.jpg', stitched)
-print("Stitched map saved as 'stitched_map.jpg'")
+# --- Stitch tiles into final map ---
+if not tiles:
+    print("No valid tiles generated.")
+    exit()
+tile_keys = np.array(list(tiles.keys()))
+x_min, y_min = tile_keys.min(axis=0)
+x_max, y_max = tile_keys.max(axis=0)
+tile_w = x_max - x_min + 1
+tile_h = y_max - y_min + 1
+final_map = np.zeros((tile_h * TILE_SIZE_PX, tile_w * TILE_SIZE_PX, 3), dtype=np.uint8)
+
+for (tx, ty), tile_img in tiles.items():
+    ix = tx - x_min
+    iy = ty - y_min
+    final_map[iy*TILE_SIZE_PX:(iy+1)*TILE_SIZE_PX,
+              ix*TILE_SIZE_PX:(ix+1)*TILE_SIZE_PX] = tile_img
+
+cv2.imwrite("stitched_map_tiled.jpg", final_map)
+print("Final stitched map saved as 'stitched_map_tiled.jpg'")
